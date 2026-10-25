@@ -1,0 +1,8 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+startup_log.txt
+.DS_Store
+.vscode/

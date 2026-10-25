@@ -10,7 +10,7 @@ import time
 from typing import Any
 import cv2
 import numpy as np
-from processing.morphology_module import create_kernel, apply_morphology, binarize_image
+from processing.morphology_module import create_kernel, apply_morphology, binarize_image, separate_touching_objects
 from processing.connected_components_module import run_connected_components, colorize_labels
 
 REGION_OPERATIONS = ("erosion", "dilation", "opening", "closing")
@@ -31,6 +31,8 @@ class PipelineConfig:
     algorithm: str = "opencv"  # opencv | scratch
     min_area: int = 100
     max_area: int | None = None
+    use_watershed: bool = False   # Mặc định TẮT, bảo toàn pipeline cũ
+    distance_ratio: float = 0.35  # Ngưỡng lõi marker từ Quang
 
     def validate(self) -> None:
         if self.operation not in ALL_OPERATIONS:
@@ -51,6 +53,8 @@ class PipelineConfig:
             raise ValueError("Connectivity phải là 4 hoặc 8")
         if self.algorithm not in ("opencv", "scratch"):
             raise ValueError("Algorithm phải là opencv hoặc scratch")
+        if not 0.05 <= self.distance_ratio <= 0.95:
+            raise ValueError("Distance Ratio phải trong khoảng 0.05..0.95")
         if self.min_area < 0:
             raise ValueError("Min Area không được âm")
         if self.max_area is not None and self.max_area < self.min_area:
@@ -156,18 +160,41 @@ def process_image(image_bgr: np.ndarray, cfg: PipelineConfig) -> dict[str, Any]:
     n_labels = None
     labels = None
     colored = None
+    watershed_markers = None
+    used_watershed = bool(countable and cfg.use_watershed)
+    times["watershed_ms"] = 0.0
     t = time.perf_counter()
     if countable:
-        n_labels, labels = run_connected_components(mask_for_ccl, cfg.connectivity, cfg.algorithm)  # Linh
-        colored = colorize_labels(labels)  # RGB để hiển thị, KHÔNG thống kê
-        times["ccl_ms"] = 1000 * (time.perf_counter()-t)
+        if used_watershed:
+            # Watershed trả marker -1 (biên), 1 (nền), >1 (vật thể).
+            # KHÔNG dùng CCL trên mặt nạ này: kết nối chéo có thể gộp trở lại
+            # các vật thể Watershed vừa tách. Giữ nhãn Watershed và chuẩn hóa
+            # về 0 = nền, 1..N = vùng để Minh Anh tính thống kê chính xác.
+            separated, watershed_markers = separate_touching_objects(
+                mask_for_ccl, distance_ratio=cfg.distance_ratio
+            )
+            times["watershed_ms"] = 1000 * (time.perf_counter() - t)
+            mask_for_ccl = separated
+            marker_ids = np.unique(watershed_markers[watershed_markers > 1])
+            labels = np.zeros(watershed_markers.shape, dtype=np.int32)
+            for new_id, marker_id in enumerate(marker_ids, start=1):
+                labels[watershed_markers == marker_id] = new_id
+            n_labels = len(marker_ids) + 1  # nền là nhãn 0
+            colored = colorize_labels(labels)
+            times["ccl_ms"] = 0.0
+            note = "Các vùng đang được tách và gán nhãn bằng Watershed."
+        else:
+            n_labels, labels = run_connected_components(
+                mask_for_ccl, cfg.connectivity, cfg.algorithm
+            )  # Linh: CCL OpenCV/Scratch giữ nguyên
+            colored = colorize_labels(labels)
+            times["ccl_ms"] = 1000 * (time.perf_counter() - t)
         t = time.perf_counter()
-        stats = _optional_statistics(labels, image_bgr, cfg)
-        times["stats_ms"] = 1000 * (time.perf_counter()-t)
+        stats = _optional_statistics(labels, image_bgr, cfg)  # Minh Anh giữ nguyên
+        times["stats_ms"] = 1000 * (time.perf_counter() - t)
     else:
-        times["ccl_ms"] = 0.
-        times["stats_ms"] = 0.
-
+        times["ccl_ms"] = 0.0
+        times["stats_ms"] = 0.0
     times["total_ms"] = sum(times.values())
     return {
         "original_bgr": image_bgr,
@@ -175,6 +202,9 @@ def process_image(image_bgr: np.ndarray, cfg: PipelineConfig) -> dict[str, Any]:
         "binary": binary,
         "morphology": morph,
         "count_mask": mask_for_ccl,
+        "watershed_markers": watershed_markers,
+        "used_watershed": used_watershed,
+        "label_method": "watershed" if used_watershed else "connected_components",
         "colored_rgb": colored,
         "labels": labels,
         "num_labels": n_labels,

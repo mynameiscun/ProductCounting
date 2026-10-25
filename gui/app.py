@@ -4,6 +4,7 @@ Tách biệt phần điều khiển, hiển thị và thuật toán xử lý ả
 """
 from __future__ import annotations
 import concurrent.futures
+import csv
 import queue
 import sys
 from dataclasses import replace
@@ -72,6 +73,8 @@ class ProductCounterApp(ctk.CTk):
         self.kernel_value = tk.IntVar(value=3)
         self.iterations_value = tk.IntVar(value=1)
         self.threshold_value = tk.IntVar(value=127)
+        self.use_watershed = tk.BooleanVar(value=False)
+        self.distance_ratio = tk.DoubleVar(value=0.35)
         # Ngưỡng T tự động chỉ phục vụ HIỂN THỊ, không ghi đè ngưỡng Manual.
         self._otsu_threshold = None
 
@@ -186,6 +189,32 @@ class ProductCounterApp(ctk.CTk):
                  width=155,fg_color=SURFACE_2,selected_color="#146E69",
                  command=lambda _:self._user_changed()).pack(side="right")
 
+        # Chế độ tách vật thể chạm nhau mới từ Quang, mặc định tắt.
+        # Khi bật, Watershed sẽ gán nhãn trực tiếp cho vùng đã tách;
+        # CCL và Connectivity vẫn được giữ cho chế độ thông thường.
+        waterframe = ctk.CTkFrame(self.sidebar_scroll, fg_color=SURFACE_2,
+                                  corner_radius=10, border_width=1, border_color=BORDER)
+        waterframe.pack(fill="x", padx=14, pady=(10, 4))
+        ctk.CTkSwitch(waterframe, text="Tách sản phẩm chạm nhau (Watershed)",
+                      variable=self.use_watershed, progress_color="#168479",
+                      button_color=FG, font=ctk.CTkFont(size=11, weight="bold"),
+                      command=self._user_changed).pack(anchor="w", padx=11, pady=(10, 6))
+        waterrow = ctk.CTkFrame(waterframe, fg_color="transparent")
+        waterrow.pack(fill="x", padx=11)
+        self._label(waterrow, "Mức tách (Distance Ratio)", 10, color=MUTED).pack(side="left")
+        self.water_ratio_display = self._label(waterrow, "0.35", 10, True, ACCENT)
+        self.water_ratio_display.pack(side="right")
+        self.water_ratio_slider = ctk.CTkSlider(
+            waterframe, from_=0.15, to=0.70, number_of_steps=11,
+            progress_color=ACCENT, button_color=ACCENT,
+            command=self._on_watershed_ratio)
+        self.water_ratio_slider.pack(fill="x", padx=11, pady=(4, 6))
+        self.water_ratio_slider.set(0.35)
+        self._label(waterframe,
+                    "Bật khi các vật thể dính nhau. Chế độ này gán nhãn bằng Watershed thay cho CCL 4/8.",
+                    10, color=MUTED, wraplength=272, justify="left").pack(
+                        anchor="w", padx=11, pady=(0, 10))
+
         self._section_title("THỐNG KÊ SẢN PHẨM")
         statsfields=ctk.CTkFrame(self.sidebar_scroll,fg_color="transparent")
         statsfields.pack(fill="x",padx=14)
@@ -200,8 +229,16 @@ class ProductCounterApp(ctk.CTk):
         for e in (self.min_area_entry,self.max_area_entry):
             e.bind("<Return>", lambda _: self.request_process())
             e.bind("<FocusOut>", lambda _: self.request_process())
-        self._label(self.sidebar_scroll,"Kết quả đếm hợp lệ sẽ có khi hoàn tất phần thống kê của Minh Anh.",
-                    10,color=WARNING,wraplength=295,justify="left").pack(anchor="w",padx=14,pady=(6,18))
+        self._label(self.sidebar_scroll,
+                    "Chỉ đếm các vùng có diện tích trong khoảng Min / Max Area.",
+                    10,color=MUTED,wraplength=295,justify="left").pack(anchor="w",padx=14,pady=(6,8))
+        self.details_button = ctk.CTkButton(
+            self.sidebar_scroll, text="Xem chi tiết sản phẩm", height=34,
+            corner_radius=10, fg_color=SURFACE_2, hover_color="#213A4A",
+            border_width=1, border_color=BORDER, text_color=FG,
+            font=ctk.CTkFont(size=12), command=self._show_object_details,
+            state="disabled")
+        self.details_button.pack(fill="x", padx=14, pady=(0,18))
         self._threshold_changed(run=False)
 
         # Bên phải: thanh tiêu đề, các số liệu, 4 canvas và trạng thái
@@ -233,7 +270,7 @@ class ProductCounterApp(ctk.CTk):
         metrics.grid(row=1,column=0,sticky="ew",pady=(0,13))
         metrics.grid_columnconfigure((0,1,2),weight=1)
         self.raw_value = self._metric(metrics,0,"VÙNG LIÊN THÔNG", "—", "Tổng vùng được phát hiện")
-        self.count_value = self._metric(metrics,1,"SẢN PHẨM HỢP LỆ", "Chờ thống kê", "Đang chờ phần của Minh Anh")
+        self.count_value = self._metric(metrics,1,"SẢN PHẨM HỢP LỆ", "—", "Sau lọc diện tích")
         self.time_value = self._metric(metrics,2,"THỜI GIAN XỬ LÝ", "—", "Tổng thời gian xử lý")
 
         pics=ctk.CTkFrame(self.main_panel, fg_color="transparent")
@@ -244,7 +281,7 @@ class ProductCounterApp(ctk.CTk):
         self._viewer_card(pics,0,0,"original","ẢNH GỐC", "Ảnh đã chọn")
         self._viewer_card(pics,0,1,"binary","ẢNH NHỊ PHÂN", "Kết quả tách nền")
         self._viewer_card(pics,1,0,"morphology","SAU MORPHOLOGY", "Kết quả xử lý hình thái")
-        self._viewer_card(pics,1,1,"result","KẾT QUẢ PHÂN VÙNG", "Các vùng được tô màu")
+        self._viewer_card(pics,1,1,"result","KẾT QUẢ ĐẾM", "Khung bao sản phẩm hợp lệ")
 
         status=ctk.CTkFrame(self.main_panel,fg_color=SURFACE,corner_radius=12,border_color=BORDER,border_width=1)
         status.grid(row=3,column=0,sticky="ew",pady=(12,0))
@@ -301,6 +338,14 @@ class ProductCounterApp(ctk.CTk):
             self.iterations_slider = slider
         slider.set(initial)
         self._label(container,ends,9,color=MUTED).pack(fill="x",pady=(2,0))
+
+    def _on_watershed_ratio(self, value):
+        if self._restoring_defaults:
+            return
+        value = round(float(value), 2)
+        self.distance_ratio.set(value)
+        self.water_ratio_display.configure(text=f"{value:.2f}")
+        self._user_changed()
 
     def _auto_changed(self):
         """Bật lại auto thì phân tích ảnh đang mở; tắt auto giữ mọi giá trị."""
@@ -371,6 +416,10 @@ class ProductCounterApp(ctk.CTk):
             self.operation.set(defaults.operation)
             self.shape.set(defaults.shape)
             self.morph_input.set(defaults.morphology_input)
+            self.use_watershed.set(defaults.use_watershed)
+            self.distance_ratio.set(defaults.distance_ratio)
+            self.water_ratio_slider.set(defaults.distance_ratio)
+            self.water_ratio_display.configure(text=f"{defaults.distance_ratio:.2f}")
 
             # Connected Components
             self.connectivity.set(str(defaults.connectivity))
@@ -488,6 +537,9 @@ class ProductCounterApp(ctk.CTk):
             return
         self.image_path=Path(path)
         self.image_bgr=image
+        # Ảnh mới chưa có kết quả: không hiển thị/thao tác với số liệu của ảnh cũ.
+        self.last_result = None
+        self.details_button.configure(state="disabled")
         self._otsu_threshold = None
         self._manual_override = not self.auto_mode.get()  # Ảnh mới được auto lại dù ảnh trước có chỉnh tay.
         self._threshold_changed(run=False)
@@ -515,6 +567,8 @@ class ProductCounterApp(ctk.CTk):
            connectivity=int(self.connectivity.get()),
            algorithm=self.algorithm.get().lower(),
            min_area=min_area,max_area=max_area,
+           use_watershed=self.use_watershed.get(),
+           distance_ratio=self.distance_ratio.get(),
         )
 
     def request_process(self,immediate=False):
@@ -584,6 +638,7 @@ class ProductCounterApp(ctk.CTk):
             text=f"{'Tự động theo ảnh' if result.get('auto_info') is not None else 'Chỉnh tay'}: {operation_name}  •  {shape_name} {cfg.kernel_size}×{cfg.kernel_size}"
                  f"  •  {cfg.iterations} lần  •  {threshold_desc}  •  {cfg.connectivity} hướng"
                  f"  •  {'OpenCV' if cfg.algorithm == 'opencv' else 'Scratch BFS'}"
+                 + (f"  •  Watershed {cfg.distance_ratio:.2f}" if result.get("used_watershed") else "")
         )
         # Với Morphology ảnh xám, mask đem đi đếm được cắt ngưỡng SAU Morphology.
         # Vì vậy, khi đó hiển thị mask cuối cùng để người dùng thấy đúng ảnh đưa vào CCL.
@@ -591,13 +646,19 @@ class ProductCounterApp(ctk.CTk):
         self.views["binary"]["canvas"].set_image(binary_preview)
         if cfg.morphology_input == "gray" and result["countable"]:
             self.views["binary"]["subtitle"].configure(text=threshold_desc + " • Sau Morphology")
-        self.views["morphology"]["canvas"].set_image(result["morphology"])
+        self.views["morphology"]["canvas"].set_image(
+            result["count_mask"] if result.get("used_watershed") else result["morphology"]
+        )
         self.views["morphology"]["subtitle"].configure(
-            text=f"{operation_name} • {shape_name} {cfg.kernel_size}×{cfg.kernel_size} • {cfg.iterations} lần • {source_name}")
+            text=(f"Sau tách Watershed • Ratio {cfg.distance_ratio:.2f}"
+                  if result.get("used_watershed") else
+                  f"{operation_name} • {shape_name} {cfg.kernel_size}×{cfg.kernel_size} • {cfg.iterations} lần • {source_name}"))
         if result["countable"]:
             if result["annotated_bgr"] is not None:
                 self.views["result"]["canvas"].set_image(result["annotated_bgr"])
-                self.views["result"]["subtitle"].configure(text="Sản phẩm hợp lệ đã được đánh dấu")
+                self.views["result"]["subtitle"].configure(
+                    text="Sản phẩm hợp lệ • Tách Watershed" if result.get("used_watershed")
+                    else "Sản phẩm hợp lệ đã được đánh dấu")
             else:
                 self.views["result"]["canvas"].set_image(result["colored_rgb"],rgb=True)
                 self.views["result"]["subtitle"].configure(text=f"{result['raw_count']} vùng • Kết nối {cfg.connectivity} hướng • {cfg.algorithm.upper() if cfg.algorithm == 'opencv' else 'Scratch BFS'}")
@@ -607,7 +668,9 @@ class ProductCounterApp(ctk.CTk):
             self.views["result"]["subtitle"].configure(text="Chọn phép co, giãn, Opening hoặc Closing để phân vùng")
             self.raw_value.configure(text="—")
         count=result["count"]
-        self.count_value.configure(text="Chờ thống kê" if count is None else str(count))
+        self.count_value.configure(text="—" if count is None else str(count))
+        # Nút chỉ khả dụng khi module Statistics đã xử lý thành công một ảnh đếm được.
+        self.details_button.configure(state="normal" if count is not None else "disabled")
         self.time_value.configure(text=f"{result['times']['total_ms']:.1f} ms")
         if not result["countable"]:
             status_text = (
@@ -615,13 +678,93 @@ class ProductCounterApp(ctk.CTk):
                 "Chọn Erosion, Dilation, Opening hoặc Closing để phân vùng đối tượng."
             )
         elif count is None:
-            status_text = "Ảnh đã được cập nhật. Phần đếm sản phẩm hợp lệ đang chờ Minh Anh."
+            status_text = "Không có kết quả thống kê. Vui lòng kiểm tra module Statistics."
         else:
-            status_text = "Đã cập nhật kết quả."
+            raw = result["raw_count"]
+            status_text = (f"Đã đếm {count} sản phẩm hợp lệ từ {raw} vùng sau Watershed."
+                           if result.get("used_watershed") else
+                           f"Đã đếm {count} sản phẩm hợp lệ từ {raw} vùng liên thông.")
         self.status_label.configure(
             text=status_text,
             text_color=WARNING if not result["countable"] else MUTED,
         )
+
+    def _show_object_details(self):
+        """Hiển thị các thống kê do Minh Anh trả về, không tính toán lại nhãn."""
+        result = self.last_result
+        if result is None or result.get("stats") is None:
+            messagebox.showinfo("Chưa có thống kê", "Hãy mở và xử lý ảnh trước khi xem chi tiết.")
+            return
+        stats = result["stats"]
+        objects = stats["objects"]
+        if getattr(self, "_details_window", None) is not None and self._details_window.winfo_exists():
+            self._details_window.destroy()
+
+        dialog = ctk.CTkToplevel(self)
+        self._details_window = dialog
+        dialog.title("Thống kê sản phẩm")
+        dialog.geometry("850x560")
+        dialog.minsize(650, 400)
+        dialog.configure(fg_color=BG)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(2, weight=1)
+
+        self._label(dialog, f"{stats['count']} sản phẩm hợp lệ", 21, True).grid(
+            row=0, column=0, sticky="w", padx=22, pady=(20, 4))
+        self._label(dialog, "Diện tích tính bằng pixel² · Tâm và khung bao tính bằng pixel",
+                    11, color=MUTED).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 8))
+
+        text_box = ctk.CTkTextbox(dialog, fg_color=SURFACE, text_color=FG,
+                                  border_color=BORDER, border_width=1,
+                                  font=("Consolas", 12), wrap="none")
+        text_box.grid(row=2, column=0, sticky="nsew", padx=22, pady=10)
+        lines = [f"{'STT':>4}  {'ID':>6}  {'AREA':>9}  {'TÂM (X,Y)':>18}  {'BBOX (X,Y,W,H)':>22}", "─" * 77]
+        for i, obj in enumerate(objects[:300], 1):
+            cx, cy = obj["centroid"]
+            x, y, width, height = obj["bbox"]
+            lines.append(f"{i:>4}  {obj['id']:>6}  {obj['area']:>9}  "
+                         f"{f'({cx:.1f}, {cy:.1f})':>18}  {f'({x}, {y}, {width}, {height})':>22}")
+        if len(objects) > 300:
+            lines.append(f"\nChỉ hiển thị 300/{len(objects)} đối tượng. Xuất CSV để xem toàn bộ.")
+        if not objects:
+            lines.append("Không có vùng nào thỏa điều kiện Min/Max Area.")
+        text_box.insert("1.0", "\n".join(lines))
+        text_box.configure(state="disabled")
+
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.grid(row=3, column=0, sticky="e", padx=22, pady=(4, 18))
+        ctk.CTkButton(actions, text="Xuất CSV", fg_color=ACCENT,
+                      hover_color="#25B99F", text_color="#0B211B",
+                      command=self._export_statistics_csv).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(actions, text="Đóng", fg_color=SURFACE_2,
+                      command=dialog.destroy).pack(side="left")
+        dialog.lift()
+        dialog.focus_force()
+
+    def _export_statistics_csv(self):
+        """Xuất đầy đủ đối tượng hợp lệ sang bảng CSV có thể mở trong Excel."""
+        result = self.last_result
+        if result is None or result.get("stats") is None:
+            messagebox.showinfo("Chưa có thống kê", "Chưa có dữ liệu để xuất CSV.")
+            return
+        stem = self.image_path.stem if self.image_path else "result"
+        path = filedialog.asksaveasfilename(
+            title="Xuất thống kê sản phẩm", defaultextension=".csv",
+            initialfile=f"{stem}_statistics.csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                writer.writerow(["STT", "Label ID", "Area (pixel)", "Centroid X", "Centroid Y",
+                                 "BBox X", "BBox Y", "BBox Width", "BBox Height"])
+                for i, obj in enumerate(result["stats"]["objects"], 1):
+                    cx, cy = obj["centroid"]
+                    x, y, width, height = obj["bbox"]
+                    writer.writerow([i, obj["id"], obj["area"], cx, cy, x, y, width, height])
+            self.status_label.configure(text=f"Đã xuất thống kê: {path}", text_color=ACCENT)
+        except Exception as exc:
+            messagebox.showerror("Không xuất được CSV", str(exc))
 
     def fit_all(self):
         for view in self.views.values():view["canvas"].fit_image()

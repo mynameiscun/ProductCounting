@@ -16,7 +16,7 @@ def make_test_image():
 def test_opening_rect_3x3_count():
     result = process_image(make_test_image(), PipelineConfig(threshold_method="manual"))
     assert result["raw_count"] == 2
-    assert result["count"] is None  # Chưa có module statistics của Minh Anh
+    assert result["count"] == 2  # Đã tích hợp Statistics của Minh Anh
     assert result["labels"].dtype == np.int32
     assert result["colored_rgb"].shape == (120, 160, 3)
     assert set(np.unique(result["count_mask"])).issubset({0,255})
@@ -57,8 +57,8 @@ def test_config_guards():
         PipelineConfig(min_area=500,max_area=10).validate()
 
 
-def test_future_statistics_module_integration(monkeypatch):
-    """Kiểm chứng trước hợp đồng nhận module Minh Anh, không đặt stub vào project thật."""
+def test_statistics_contract_with_temporary_implementation(monkeypatch):
+    """Kiểm chứng hợp đồng module bằng monkeypatch; module thật có test riêng."""
     import sys
     from types import ModuleType
     fake = ModuleType("processing.statistics_module")
