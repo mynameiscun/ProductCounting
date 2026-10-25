@@ -146,6 +146,37 @@ def suggest_parameters(image_bgr: np.ndarray, previous: PipelineConfig) -> tuple
                     best = (shape, size, iterations, candidate)
     assert best is not None
     shape, size, iterations, recommended_mask = best
+
+    # Bảo vệ các sản phẩm đã tách biệt trong ảnh nhị phân đầu vào.
+    # Closing có thể vô tình nối 2 đồng xu chạm nhẹ thành 1 vùng (ví dụ:
+    # ảnh coin.png: trước Closing 13 vùng, sau Closing 5x5 còn 12 vùng).
+    # Chỉ can thiệp khi ảnh có nhiều vùng lớn khá đồng đều, như đồng xu.
+    # Các cảnh phức tạp với vật thể khác loại / bị che khuất KHÔNG đủ
+    # thông tin để khẳng định vùng nào là sản phẩm: không ép số đếm.
+    if operation == "closing":
+        h0, w0 = mask.shape
+        area_min = max(100, round(h0 * w0 * 0.001))
+
+        def significant_areas(binary_mask):
+            _, _, item_stats, _ = cv2.connectedComponentsWithStats(binary_mask, 8)
+            values = item_stats[1:, cv2.CC_STAT_AREA]
+            return values[values >= area_min]
+
+        before = significant_areas(mask)
+        after = significant_areas(recommended_mask)
+        if len(before) >= 5 and len(after) < len(before):
+            # Cảnh có nhiều vật tương tự nhau: tránh diễn giải quá mức
+            # nếu diện tích vật thể chênh lệch lớn (như bánh răng ở
+            # nhiều độ sâu, nhiều vật chồng nhau).
+            variability = float(np.std(before) / max(1.0, np.mean(before)))
+            if variability < 0.70:
+                gentle_kernel = create_kernel("ellipse", 3)
+                opening_mask = apply_morphology(mask, "opening", gentle_kernel, 1)
+                if len(significant_areas(opening_mask)) >= len(before):
+                    operation, shape, size, iterations = "opening", "ellipse", 3, 1
+                    recommended_mask = opening_mask
+                    description = "Giữ các vùng đã tách biệt; tránh Closing làm dính sản phẩm"
+
     connectivity = _connectivity_by_contact(recommended_mask)
     cfg = replace(previous,
                   operation=operation,
